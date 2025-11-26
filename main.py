@@ -2,6 +2,7 @@ import sys, os
 from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog
 from dem_loader import DEM
 from tile_cache import TileCache
+from path import xyzPath
 from viewer.dem_viewer import DEMViewer
 import config
 
@@ -18,8 +19,9 @@ def main():
 
     dem = DEM(filepath)
     tile_cache = TileCache(dem)
+    path = xyzPath(dem)
     window = QMainWindow()
-    viewer = DEMViewer(dem, tile_cache)
+    viewer = DEMViewer(dem, tile_cache, path)
     window.setCentralWidget(viewer)
     window.resize(800, 600)
     window.show()
