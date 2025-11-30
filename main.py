@@ -23,7 +23,9 @@ def main():
     window = QMainWindow()
     viewer = DEMViewer(dem, tile_cache, path)
     window.setCentralWidget(viewer)
-    window.resize(800, 600)
+    window.resize(1200, 600)
+    window.setMinimumWidth(800)
+    window.setMinimumHeight(500)
     window.show()
 
     sys.exit(app.exec())
