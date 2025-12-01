@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from typing import List, Tuple, Optional
 
@@ -6,6 +7,23 @@ class xyzPath:
     Stores and manages a path as a series of points in 3D raster space (x, y, z).
     Points are stored in raster coordinates with z values read from a DEM.
     """
+    def __init__(self, dem=None):
+        """
+        Initialize an empty path.
+        Args:
+            dem: DEM object for reading height values (optional, can be set later)
+        """
+        self.dem = dem
+        self.points = []  # List of [x, y, z] coordinates
+        self.locked = False  # When locked, start/end points cannot be modified
+
+    def shallow_copy(self):
+        """Return a shallow copy of the path (copies points and locked state, references DEM)."""
+        new_path = xyzPath(self.dem)
+        new_path.points = [pt.copy() for pt in self.points]
+        new_path.locked = self.locked
+        return new_path
+
     
     def __init__(self, dem=None):
         """
@@ -202,3 +220,68 @@ class xyzPath:
         if len(self.points) == 0:
             return False
         return index == 0 or index == len(self.points) - 1
+
+    def consolidate_consecutive_clusters(self, max_distance: float = 10) -> None:
+        """
+        Merge consecutive runs of points where adjacent points are closer than
+        `max_distance` (in the same units as x/y coordinates). Consecutive means
+        indices are contiguous; non-consecutive close points are not merged.
+
+        The collapsed point position is the mean of the clustered points' x/y
+        coordinates; if a DEM is available, the z is re-read from the DEM at
+        the rounded mean x/y, otherwise the mean z is used.
+
+        Protected endpoints (when `self.locked` is True) are not merged away.
+
+        This modifies the path in place.
+        """
+        n = len(self.points)
+        if n < 2:
+            return
+
+        def dist2(a, b):
+            return math.hypot(a[0] - b[0], a[1] - b[1])
+
+        new_pts = []
+        i = 0
+        while i < n:
+            # if next point is close, start collecting a run
+            if i < n - 1 and dist2(self.points[i], self.points[i + 1]) <= max_distance:
+                run_indices = [i]
+                j = i
+                while j < n - 1 and dist2(self.points[j], self.points[j + 1]) <= max_distance:
+                    j += 1
+                    run_indices.append(j)
+
+                # If locked and run includes protected endpoints, skip collapsing
+                if self.locked and (0 in run_indices or (n - 1) in run_indices):
+                    for k in run_indices:
+                        new_pts.append(self.points[k].copy())
+                    i = j + 1
+                    continue
+
+                # Compute mean x,y and determine z
+                xs = [self.points[k][0] for k in run_indices]
+                ys = [self.points[k][1] for k in run_indices]
+                mean_x = float(np.mean(xs))
+                mean_y = float(np.mean(ys))
+                if self.dem is not None:
+                    try:
+                        z = self.dem.get_elevation(int(mean_x), int(mean_y))
+                        if z is None:
+                            zs = [self.points[k][2] for k in run_indices]
+                            z = float(np.mean(zs))
+                    except Exception:
+                        zs = [self.points[k][2] for k in run_indices]
+                        z = float(np.mean(zs))
+                else:
+                    zs = [self.points[k][2] for k in run_indices]
+                    z = float(np.mean(zs))
+
+                new_pts.append([mean_x, mean_y, z])
+                i = j + 1
+            else:
+                new_pts.append(self.points[i].copy())
+                i += 1
+
+        self.points = new_pts

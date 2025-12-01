@@ -1,15 +1,72 @@
-from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QLabel, QSpinBox, QDoubleSpinBox, QPushButton, QHBoxLayout, QWidget, QComboBox, QVBoxLayout, QGraphicsBlurEffect
+from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QLabel, QSpinBox, QDoubleSpinBox, QPushButton, QHBoxLayout, QWidget, QComboBox, QVBoxLayout, QCheckBox
+from PySide6.QtCore import Qt, QTimer, QCoreApplication
+import threading
 from .tile_renderer import TileRenderer
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QPen, QColor, QFont, QBrush, QPixmap, QImage, QPainter
 import numpy as np
+import time
 from resegmenter import Resegmenter
 from plugin_loader import PluginLoader
-try:
-    from PIL import Image, ImageFilter
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
+
+
+class TemporaryPathManager:
+    """Manages display of temporary paths with automatic expiration."""
+    def __init__(self, scene, duration_ms=2000, update_interval_ms=50):
+        self.scene = scene
+        self.duration_ms = duration_ms
+        self.update_interval_ms = update_interval_ms
+        self.temporary_paths = []
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._update)
+    
+    def add_path(self, path, duration_ms=None):
+        """Add a path to display temporarily."""
+        if duration_ms is None:
+            duration_ms = self.duration_ms
+        
+        expiry_time = time.time() * 1000 + duration_ms
+        graphics_items = []
+        points = path.get_points()
+        
+        if len(points) > 1:
+            pen = QPen(QColor(0, 150, 0))  # Dark green
+            pen.setCosmetic(True)
+            pen.setWidth(3)
+            
+            for i in range(len(points) - 1):
+                p1, p2 = points[i], points[i + 1]
+                line = self.scene.addLine(float(p1[0]), float(p1[1]), float(p2[0]), float(p2[1]), pen)
+                line.setZValue(1)
+                graphics_items.append(line)
+        
+        self.temporary_paths.append({
+            'path': path,
+            'expiry_time': expiry_time,
+            'items': graphics_items
+        })
+        
+        if not self.timer.isActive():
+            self.timer.start(self.update_interval_ms)
+    
+    def _update(self):
+        """Remove expired paths."""
+        current_time = time.time() * 1000
+        paths_to_keep = []
+        
+        for temp_path_info in self.temporary_paths:
+            if current_time < temp_path_info['expiry_time']:
+                paths_to_keep.append(temp_path_info)
+            else:
+                for item in temp_path_info['items']:
+                    self.scene.removeItem(item)
+        
+        self.temporary_paths = paths_to_keep
+        
+        if not self.temporary_paths:
+            self.timer.stop()
+    
+    def is_active(self):
+        return len(self.temporary_paths) > 0
 
 
 class BlurredPanel(QWidget):
@@ -73,6 +130,12 @@ class DEMViewer(QGraphicsView):
         self.selected_cost_function = None
         self.selected_solver = None
         self.current_cost = None
+        # Solver run state
+        self.solver_running = False
+        self.solver_stop_event = None
+        
+        # Temporary path visualization system
+        self.temporary_path_manager = TemporaryPathManager(self.scene, duration_ms=2000)
         
         # Top panel with blur effect (backing for all top widgets)
         self.top_panel = BlurredPanel(self)
@@ -109,7 +172,8 @@ class DEMViewer(QGraphicsView):
         self.cost_label.setStyleSheet("color: white; background-color: transparent;")
         self.cost_combo = QComboBox()
         self.cost_combo.addItems(sorted(self.cost_functions.keys()))
-        self.cost_combo.currentTextChanged.connect(self.on_cost_function_selected)
+        self.cost_combo.currentTextChanged.connect(lambda name: self.calculate_cost(name))
+
         self.cost_combo.setStyleSheet("color: white; background-color: rgba(30, 30, 30, 200); border: 1px solid white; padding: 4px;")
         self.cost_combo.view().setMinimumWidth(250)
         # Make dropdown clickable
@@ -141,6 +205,8 @@ class DEMViewer(QGraphicsView):
         self.time_spinbox.setSingleStep(0.5)
         self.time_spinbox.setDecimals(2)
         self.time_spinbox.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 180);")
+        self.time_spinbox.valueChanged.connect(lambda _: self.calculate_cost(self.cost_combo.currentText()))
+
         
         self.time_layout.addWidget(self.time_label)
         self.time_layout.addWidget(self.time_spinbox)
@@ -179,12 +245,18 @@ class DEMViewer(QGraphicsView):
         self.run_solver_layout = QHBoxLayout(self.run_solver_widget)
         self.run_solver_layout.setContentsMargins(5, 5, 5, 5)
         
+        # Live update checkbox
+        self.live_update_checkbox = QCheckBox("Live Updates")
+        self.live_update_checkbox.setChecked(True)
+        self.live_update_checkbox.setStyleSheet("color: white; background-color: transparent;")
+        
         self.run_solver_button = QPushButton()
         self.run_solver_button.setStyleSheet("color: white; background-color: rgba(50, 50, 150, 200); padding: 8px; font-weight: bold;")
         self.run_solver_button.clicked.connect(self.on_run_solver)
         self.update_run_button()
         
         self.run_solver_layout.addStretch()
+        self.run_solver_layout.addWidget(self.live_update_checkbox)
         self.run_solver_layout.addWidget(self.run_solver_button)
         self.run_solver_layout.addStretch()
         
@@ -236,73 +308,38 @@ class DEMViewer(QGraphicsView):
         if self.solver_combo.count() > 0:
             self.on_solver_selected(self.solver_combo.itemText(0))
         if self.cost_combo.count() > 0:
-            self.on_cost_function_selected(self.cost_combo.itemText(0))
+            self.calculate_cost(self.cost_combo.currentText())
 
     def blur_background(self):
         """Create a gradient background for the top panel"""
-        try:
-            # Create a simple smooth gradient background
-            width = int(self.width())
-            height = self.top_panel_height
-            
-            if width <= 0 or height <= 0:
-                return
-            
-            # Create gradient array (dark at top, lighter at bottom)
-            arr = np.zeros((height, width, 4), dtype=np.uint8)
-            for y in range(height):
-                # Gradient from dark (30) to lighter (80)
-                shade = int(30 + (y / height) * 50)
-                arr[y, :] = [shade, shade, shade, 255]
-            
-            # Smooth it with a slight blur
-            if PIL_AVAILABLE:
-                pil_image = Image.fromarray(arr, 'RGBA')
-                blurred = pil_image.filter(ImageFilter.GaussianBlur(radius=5))
-                blurred_arr = np.array(blurred)
-            else:
-                blurred_arr = arr
-            
-            # Convert to QPixmap
-            q_img = QImage(bytes(blurred_arr), width, height, QImage.Format_RGBA8888)
-            pixmap = QPixmap.fromImage(q_img)
-            
-            # Set on panel
-            self.top_panel.set_background(pixmap)
-        except Exception as e:
-            print(f"Background creation failed: {e}")
+        self._create_gradient_background(self.top_panel, self.top_panel_height, invert=False)
     
     def blur_background_bottom(self):
         """Create a gradient background for the bottom panel (reverse gradient)"""
+        self._create_gradient_background(self.bottom_panel, self.bottom_panel_height, invert=True)
+    
+    def _create_gradient_background(self, panel, height, invert=False):
+        """Create a simple gradient background pixmap and apply to panel."""
         try:
-            # Create a simple smooth gradient background
             width = int(self.width())
-            height = self.bottom_panel_height
-            
             if width <= 0 or height <= 0:
                 return
             
-            # Create gradient array (lighter at top, dark at bottom)
+            # Create gradient array
             arr = np.zeros((height, width, 4), dtype=np.uint8)
             for y in range(height):
-                # Gradient from lighter (80) to dark (30)
-                shade = int(80 - (y / height) * 50)
+                if invert:
+                    # Lighter at top, dark at bottom
+                    shade = int(80 - (y / height) * 50)
+                else:
+                    # Dark at top, lighter at bottom
+                    shade = int(30 + (y / height) * 50)
                 arr[y, :] = [shade, shade, shade, 255]
             
-            # Smooth it with a slight blur
-            if PIL_AVAILABLE:
-                pil_image = Image.fromarray(arr, 'RGBA')
-                blurred = pil_image.filter(ImageFilter.GaussianBlur(radius=5))
-                blurred_arr = np.array(blurred)
-            else:
-                blurred_arr = arr
-            
-            # Convert to QPixmap
-            q_img = QImage(bytes(blurred_arr), width, height, QImage.Format_RGBA8888)
+            # Convert to QPixmap and set on panel (no blur)
+            q_img = QImage(bytes(arr), width, height, QImage.Format_RGBA8888)
             pixmap = QPixmap.fromImage(q_img)
-            
-            # Set on panel
-            self.bottom_panel.set_background(pixmap)
+            panel.set_background(pixmap)
         except Exception as e:
             print(f"Background creation failed: {e}")
 
@@ -383,6 +420,7 @@ class DEMViewer(QGraphicsView):
                 self.path.locked = False
                 self.redraw_path()
                 self.update_stats()
+                self.update_cost_display()
                 return
             
             # Check if clicking on an existing point (within select radius in screen space)
@@ -404,8 +442,7 @@ class DEMViewer(QGraphicsView):
             # Otherwise, add a new point
             try:
                 self.path.add_point(x, y)
-                self.redraw_path()
-                self.update_stats()
+                self.update_all()
             except (ValueError, IndexError) as e:
                 print(f"Error adding point: {e}")
         
@@ -414,8 +451,8 @@ class DEMViewer(QGraphicsView):
             if self.path_is_editing and len(self.path.get_points()) > 0:
                 self.path_is_editing = False
                 self.path.locked = True
-                self.redraw_path()
-                self.update_stats()
+                self.update_all()
+
         
         else:
             super().mousePressEvent(event)
@@ -445,8 +482,7 @@ class DEMViewer(QGraphicsView):
             try:
                 for i in self.dragging_point_indices:
                     self.path.shift_point(i, dx, dy, update_z=True)
-                self.redraw_path()
-                self.update_stats()
+                self.update_all()
             except (ValueError, IndexError) as e:
                 print(f"Error shifting point: {e}")
         else:
@@ -487,8 +523,7 @@ class DEMViewer(QGraphicsView):
             if self.path.get_point_count() > 2:  # Keep at least 2 points (start and end)
                 try:
                     self.path.delete_point(self.path.get_point_count() - 1)
-                    self.redraw_path()
-                    self.update_stats()
+                    self.update_all()
                 except IndexError as e:
                     print(f"Error deleting point: {e}")
         else:
@@ -501,54 +536,59 @@ class DEMViewer(QGraphicsView):
             self.scene.removeItem(item)
         self.path_points_items.clear()
         
+        self._draw_segments()
+        if self.path_is_editing:
+            self._draw_points()
+    
+    def _draw_segments(self):
+        """Draw line segments connecting path points."""
+        points = self.path.get_points()
+        if len(points) < 2:
+            return
+        
+        line_color = QColor(100, 150, 255) if self.path_is_editing else QColor(50, 50, 80)
+        pen = QPen(line_color)
+        pen.setCosmetic(True)
+        pen.setWidth(2)
+        
+        for i in range(len(points) - 1):
+            x1, y1 = int(points[i][0]), int(points[i][1])
+            x2, y2 = int(points[i + 1][0]), int(points[i + 1][1])
+            line = self.scene.addLine(x1, y1, x2, y2, pen)
+            line.setZValue(1)
+            self.path_points_items.append(line)
+    
+    def _draw_points(self):
+        """Draw point markers (only in edit mode)."""
         points = self.path.get_points()
         
-        # Determine line color based on editing state
-        if self.path_is_editing:
-            line_color = QColor(100, 150, 255)
-        else:
-            line_color = QColor(50, 50, 80)
-        
-        # Draw line segments connecting points with zoom-independent line weight
-        if len(points) > 1:
-            pen = QPen(line_color)
-            pen.setCosmetic(True)  # Make line width zoom-independent (always 1 pixel)
-            pen.setWidth(2)
-            for i in range(len(points) - 1):
-                x1, y1 = int(points[i][0]), int(points[i][1])
-                x2, y2 = int(points[i + 1][0]), int(points[i + 1][1])
-                line = self.scene.addLine(x1, y1, x2, y2, pen)
-                line.setZValue(1)
-                self.path_points_items.append(line)
-        
-        # Draw point markers (only visible in edit mode)
-        if self.path_is_editing:
-            for i, point in enumerate(points):
-                x, y = int(point[0]), int(point[1])
-                # Different colors for start (green), middle (blue), and end (red) points
-                if i == 0:
-                    color = QColor(0, 255, 0)
-                elif i == len(points) - 1:
-                    color = QColor(255, 0, 0)
-                else:
-                    color = QColor(0, 0, 255)
-                
-                # Add glow effect if hovered
-                if i == self.hovered_point_index:
-                    # Draw glow circle first (larger, semi-transparent fill)
-                    glow_color = QColor(color.red(), color.green(), color.blue(), 120)
-                    glow_pen = QPen(Qt.transparent)
-                    glow_brush = QBrush(glow_color)
-                    glow = self.scene.addEllipse(x - 10, y - 10, 20, 20, glow_pen, glow_brush)
-                    glow.setZValue(1)
-                    self.path_points_items.append(glow)
-                
-                pen = QPen(color)
-                pen.setCosmetic(True)
-                pen.setWidth(3)
-                circle = self.scene.addEllipse(x - 3, y - 3, 6, 6, pen)
-                circle.setZValue(2)
-                self.path_points_items.append(circle)
+        for i, point in enumerate(points):
+            x, y = int(point[0]), int(point[1])
+            
+            # Color by position: green (start), blue (middle), red (end)
+            if i == 0:
+                color = QColor(0, 255, 0)
+            elif i == len(points) - 1:
+                color = QColor(255, 0, 0)
+            else:
+                color = QColor(0, 0, 255)
+            
+            # Draw glow if hovered
+            if i == self.hovered_point_index:
+                glow_color = QColor(color.red(), color.green(), color.blue(), 120)
+                glow_pen = QPen(Qt.transparent)
+                glow_brush = QBrush(glow_color)
+                glow = self.scene.addEllipse(x - 10, y - 10, 20, 20, glow_pen, glow_brush)
+                glow.setZValue(1)
+                self.path_points_items.append(glow)
+            
+            # Draw point circle
+            pen = QPen(color)
+            pen.setCosmetic(True)
+            pen.setWidth(3)
+            circle = self.scene.addEllipse(x - 3, y - 3, 6, 6, pen)
+            circle.setZValue(2)
+            self.path_points_items.append(circle)
     
     def update_stats(self):
         """Update the stats label with path length and elevation gain"""
@@ -569,13 +609,19 @@ Mode: {'EDIT' if self.path_is_editing else 'FIXED'}"""
         
         self.stats_label.setText(stats_text)
     
-    def update_cost_display(self):
+    def update_cost_display(self):      
         """Update the cost display label"""
         if self.current_cost is not None:
             cost_html = f"Cost: <span style='font-size: 18px;'><b>{self.current_cost:.1f}</b></span>"
             self.cost_display_label.setText(cost_html)
-        else:
-            self.cost_display_label.setText("")
+    
+    def update_all(self):
+        """Update all UI elements: redraw, recalc cost, update stats and display."""
+        self.redraw_path()
+        self.update_stats()
+        self.calculate_cost(self.cost_combo.currentText())
+        self.update_cost_display()
+
     
     def add_print_message(self, message):
         """Add a message to the print label and console"""
@@ -584,9 +630,18 @@ Mode: {'EDIT' if self.path_is_editing else 'FIXED'}"""
     
     def update_run_button(self):
         """Update the run solver button text"""
+        if self.solver_running:
+            # Running state: show Stop and red
+            self.run_solver_button.setText("Stop")
+            self.run_solver_button.setEnabled(True)
+            self.run_solver_button.setStyleSheet("color: white; background-color: rgba(200, 50, 50, 230); padding: 8px; font-weight: bold;")
+            return
+
+        # Not running
         if self.selected_solver:
             self.run_solver_button.setText("Run Solver")
             self.run_solver_button.setEnabled(True)
+            self.run_solver_button.setStyleSheet("color: white; background-color: rgba(50, 50, 150, 200); padding: 8px; font-weight: bold;")
         else:
             self.run_solver_button.setText("No Solver Selected")
             self.run_solver_button.setEnabled(False)
@@ -597,84 +652,163 @@ Mode: {'EDIT' if self.path_is_editing else 'FIXED'}"""
             self.selected_solver = solver_name
             self.update_run_button()
     
-    def on_cost_function_selected(self, func_name):
+    def calculate_cost(self, func_name):
         """Handle cost function selection and calculation"""
+        print(func_name)
         if func_name:  # Always true now since blank is gone
             self.selected_cost_function = func_name
             cost_func = self.cost_functions.get(func_name)
             if cost_func and self.path:
                 try:
-                    self.current_cost = cost_func(self.path)
+                    self.current_cost = cost_func(self.path, self.time_spinbox.value())
                 except Exception as e:
                     print(f"Error calculating cost: {e}")
                     self.current_cost = None
             self.update_cost_display()
     
+    def add_temporary_path(self, path, duration_ms=None):
+        """Add a path that will be displayed for a short time then removed."""
+        self.temporary_path_manager.add_path(path, duration_ms)
+    
     def on_run_solver(self):
         """Handle run solver button click"""
-        if not self.selected_solver:
-            self.add_print_message("No solver selected")
+        # If solver is running, request stop
+        if self.solver_running:
+            if self.solver_stop_event:
+                self.add_print_message("Stopping solver...")
+                self.solver_stop_event.set()
             return
-        if not self.path or self.path.get_point_count() < 2:
-            self.add_print_message("No valid path")
+
+        # Start solver
+        if not self.selected_solver or not self.path or self.path.get_point_count() < 2:
+            self.add_print_message("No valid solver or path")
             return
+
         self.add_print_message(f"Running solver: {self.selected_solver}")
+
+        solver_module = self.solvers.get(self.selected_solver)
+        cost_func = self.cost_functions.get(self.selected_cost_function)
+
+        if not solver_module or not cost_func:
+            self.add_print_message("Solver or cost function not found")
+            return
+
+        # Prepare stop event and set running state
+        self.solver_stop_event = threading.Event()
+        self.solver_running = True
+        self.update_run_button()
+
+        # Run solver synchronously but cooperative: optimize checks stop_event and callbacks process events
+        try:
+            self._execute_solver(solver_module, cost_func, stop_event=self.solver_stop_event)
+        finally:
+            # Ensure state reset
+            self.solver_running = False
+            self.solver_stop_event = None
+            self.update_run_button()
+    
+    def _execute_solver(self, solver_module, cost_func, stop_event=None):
+        """Execute the solver with cost function and update path."""
+        import perturbers.singlePointMover as spm
+        
+        time_val = self.time_spinbox.value()
+        
+        # Wrap cost function to bind time parameter
+        def wrapped_cost(path):
+            try:
+                return cost_func(path, time_val)
+            except Exception as e:
+                print(f"Cost function error: {e}")
+                return float('inf')
+        
+        # Show initial cost
+        initial_cost = wrapped_cost(self.path)
+        self.add_print_message(f"Initial cost: {initial_cost:.2f}")
+        
+        # Define callback for live updates
+        def sa_callback(current_best_path, current_best_cost, iter_count):
+            if self.live_update_checkbox.isChecked():
+                self.add_temporary_path(current_best_path)
+                self.add_print_message(f"Iter {iter_count}: cost = {current_best_cost:.2f}")
+                QCoreApplication.processEvents()
+            # Also allow UI to stop solver: if stop_event set, nothing else needed here
+        
+        # Run simulated annealing
+        best_path, best_cost = solver_module.optimize(
+            self.path,
+            wrapped_cost,
+            [spm],
+            callback=sa_callback,
+            stop_event=stop_event
+        )
+        
+        # Update path and display
+        self.path = best_path
+        self.current_cost = best_cost
+        self.redraw_path()
+        self.update_stats()
+        self.update_cost_display()
+        self.add_print_message(f"Finished! Cost: {initial_cost:.2f} → {best_cost:.2f}")
     
     def resizeEvent(self, event):
         """Position UI elements at proper locations"""
         super().resizeEvent(event)
-        
-        # Position and layer top panel
+        self._position_panels()
+        self._position_top_widgets()
+        self._position_bottom_widgets()
+    
+    def _position_panels(self):
+        """Position and style background panels."""
         self.top_panel.setGeometry(0, 0, self.width(), self.top_panel_height)
-        self.top_panel.stackUnder(self.stats_label)  # Keep below widgets
+        self.top_panel.stackUnder(self.stats_label)
         self.blur_background()
         
-        # Position stats label (top left) - wider and taller to prevent clipping
+        self.bottom_panel.setGeometry(0, self.height() - self.bottom_panel_height, self.width(), self.bottom_panel_height)
+        self.bottom_panel.stackUnder(self.print_label)
+        self.blur_background_bottom()
+    
+    def _position_top_widgets(self):
+        """Position top panel widgets."""
         self.stats_label.setGeometry(10, 10, 300, 80)
         
-        # Position solver dropdown (centered horizontally, offset 150px left)
+        # Solver dropdown (centered, offset left)
         solver_width = self.solver_widget.sizeHint().width()
         solver_height = self.solver_widget.sizeHint().height()
         solver_x = (self.width() - solver_width) // 2 - 150
-        solver_y = 10
-        self.solver_widget.setGeometry(solver_x, solver_y, solver_width, solver_height)
+        self.solver_widget.setGeometry(solver_x, 10, solver_width, solver_height)
         
-        # Position cost function dropdown at top right
+        # Cost function dropdown (top right)
         cost_width = self.cost_widget.sizeHint().width()
         cost_height = self.cost_widget.sizeHint().height()
         cost_x = self.width() - cost_width - 10
-        cost_y = 10
-        self.cost_widget.setGeometry(cost_x, cost_y, cost_width, cost_height)
+        self.cost_widget.setGeometry(cost_x, 10, cost_width, cost_height)
         
-        # Position time input below cost function (top right)
+        # Time input (top right, below cost)
         time_width = self.time_widget.sizeHint().width()
         time_height = self.time_widget.sizeHint().height()
         time_x = self.width() - time_width - 10
-        time_y = cost_y + cost_height + 5
+        time_y = 10 + cost_height + 5
         self.time_widget.setGeometry(time_x, time_y, time_width, time_height)
-        
-        # Position bottom panel
-        self.bottom_panel.setGeometry(0, self.height() - self.bottom_panel_height, self.width(), self.bottom_panel_height)
-        self.bottom_panel.stackUnder(self.print_label)  # Keep below widgets
-        self.blur_background_bottom()
-        
-        # Position resegment controls at bottom right
+    
+    def _position_bottom_widgets(self):
+        """Position bottom panel widgets."""
+        # Resegment controls (bottom right)
         reseg_width = self.resegment_widget.sizeHint().width()
         reseg_height = self.resegment_widget.sizeHint().height()
         reseg_x = self.width() - reseg_width - 10
         reseg_y = self.height() - reseg_height - 10
         self.resegment_widget.setGeometry(reseg_x, reseg_y, reseg_width, reseg_height)
         
-        # Position print message label (bottom left, aligned with cost_display_label horizontally, centered with resegment button vertically)
-        print_y = reseg_y + (reseg_height // 2) - 15  # Center vertically with resegment button
+        # Print message (bottom left, vertically centered with controls)
+        print_y = reseg_y + (reseg_height // 2) - 15
         self.print_label.setGeometry(10, print_y, 400, 30)
         
-        # Position solver run button at bottom center
+        # Solver run button (bottom center)
         run_width = self.run_solver_widget.sizeHint().width()
         run_height = self.run_solver_widget.sizeHint().height()
-        x = (self.width() - run_width) // 2
-        y = self.height() - run_height - 10
-        self.run_solver_widget.setGeometry(x, y, run_width, run_height)
+        run_x = (self.width() - run_width) // 2
+        run_y = self.height() - run_height - 10
+        self.run_solver_widget.setGeometry(run_x, run_y, run_width, run_height)
     
     def on_resegment(self):
         """Handle resegmentation button click"""
@@ -698,8 +832,8 @@ Mode: {'EDIT' if self.path_is_editing else 'FIXED'}"""
         
         # Replace the path
         self.path = new_path
-        self.redraw_path()
-        self.update_stats()
+        self.path.update_z_values()
+        self.update_all()
         self.add_print_message(f"Path resegmented: {current_count} -> {target_count} points")
     
     def on_simplify(self):
@@ -721,6 +855,5 @@ Mode: {'EDIT' if self.path_is_editing else 'FIXED'}"""
         
         # Replace the path
         self.path = new_path
-        self.redraw_path()
-        self.update_stats()
+        self.update_all()
         self.add_print_message(f"Path simplified: {original_count} -> {new_count} points (removed {original_count - new_count} collinear points)")

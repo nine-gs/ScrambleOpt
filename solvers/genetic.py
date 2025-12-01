@@ -1,5 +1,5 @@
-name = "Genetic Algorithm"
+# name = "Genetic Algorithm"
 
-def optimize(path):
-    """Genetic Algorithm solver"""
-    pass
+# def optimize(path):
+#     """Genetic Algorithm solver"""
+#     pass
