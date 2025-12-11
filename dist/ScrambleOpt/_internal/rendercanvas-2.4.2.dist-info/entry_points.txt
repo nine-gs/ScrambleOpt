@@ -1,0 +1,4 @@
+[pyinstaller40]
+hook-dirs=rendercanvas.__pyinstaller:get_hook_dirs
+tests=rendercanvas.__pyinstaller:get_test_dirs
+

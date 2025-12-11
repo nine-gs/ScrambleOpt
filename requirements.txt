@@ -1,0 +1,6 @@
+PySide6
+numpy
+rasterio
+affine
+rendercanvas
+pyinstaller
