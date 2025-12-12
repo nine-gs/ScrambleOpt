@@ -1,0 +1,13 @@
+To donload, go to this subfolder of this repository:
+
+    https://github.com/nine-gs/ScrambleOpt/tree/main/dist/ScrambleOpt
+
+Click on ScrambleOpt.exe 
+
+Download and run this file. 
+
+When the file dialog pops up, select a DEM. To work right, the DEM should have a 1m resolution and be in meters.
+
+A sample DEM named MtNaomi.tif is provided in the folder linked above.
+
+Note that I have only tested this on Windows thus far. If you try to run this on Mac or Linux, well, may the force be with you.
